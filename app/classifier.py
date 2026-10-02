@@ -2,11 +2,41 @@ import os # Reads environment variables
 from dotenv import load_dotenv # Loads values from the .env file
 from anthropic import Anthropic # Claude API client
 from app.models import TicketClassification  # Imports the Pydantic model from the app package
-
+from app.tools import check_application_status
+import json
 
 load_dotenv() # Loads ANTHROPIC_API_KEY from.env
 
 client = Anthropic() # Creates the Claude client using the API key
+
+# This is called tool schema acts as a description of tools for claude.
+# Tool schema: describes the available tool and its expected input to Claude.
+tools = [
+    {
+        "name": "check_application_status",
+        "description": "Check whether an enterprise application is currently UP, DOWN, or UNKNOWN.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "application": {
+                    "type": "string",
+                    "description": "Name of the enterprise application to check"
+                }
+            },
+            "required": ["application"]
+        }
+    }
+]
+# This acts like a dispatcher between claude's requested tool name and your actual python implementations
+def execute_tool(tool_name: str, tool_input: dict):
+    if tool_name == "check_application_status":
+        return check_application_status(
+            tool_input["application"]
+        )
+    return {
+        "error": f"Unknown tool: {tool_name}"
+    }
+
 
 SYSTEM_PROMPT = """
 You are an AI assistant responsible for classifying enterprise automation support tickets.
@@ -89,9 +119,180 @@ Ticket: {ticket_txt}
     return response.parsed_output
 
 
-#ticket = classify_ticket(
- #   "SAP application is unavailable. Bot failed 3 times with HTTP 503."
-#)
 
-#print(ticket)
-#print(ticket.model_dump_json(indent=2))
+def test_tool_calling(ticket_txt: str):
+    response = client.messages.create(
+        model = "claude-sonnet-4-5",
+        max_tokens=5000,
+        system=SYSTEM_PROMPT,
+        tools=tools,
+        messages=[
+            {
+                "role":"user",
+                "content":  f"""
+Investigate the following automation support ticket.
+
+Use the available tools when additional information would help you understand the incident.
+
+Ticket: {ticket_txt}
+"""
+            }
+        ]
+    )
+    print(response)
+# Now we get the tool name from claude's response and execute the tool
+    for block in response.content:
+        if block.type == "tool_use":
+            print("Tool requested:", block.name)
+            print("Tool input:", block.input)
+            result = execute_tool(
+                block.name,
+                block.input
+            )
+            print("Tool result:",result)
+            # Sending tool information back to claude
+            second_response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=500,
+                system=SYSTEM_PROMPT,
+                tools=tools,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"""
+            Investigate the following automation support ticket.
+
+            Use the available tools when additional information would help you understand the incident.
+
+            Ticket: {ticket_txt}
+            """
+                },
+
+                {
+                    "role": "assistant",
+                    "content": response.content
+                },
+
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id, # This is important because imagine claude
+                            # requests for 3 tools, Claude needs to know which result belongs to which request.
+                            "content": json.dumps(result) # This serializes python dictionary to JSON
+                        }
+                    ]
+                }
+            ]
+        )
+
+            print("Claude after tool result:")
+            print(second_response)
+
+
+test_tool_calling(
+    "SAP is not responding and the invoice automation failed."
+)
+
+result = execute_tool("check_application_status",{"application":"SAP"})
+print(result)
+
+"""
+
+Agent loop logic :
+ while True:
+
+    response = ask_claude()
+
+    if response wants a tool:
+        execute_tool()
+        add_result_to_messages
+
+    else:
+        return response """
+
+def run_agent(ticket_txt: str):
+
+    messages = [
+        {
+            "role": "user",
+            "content": f"""
+Investigate the following automation support ticket.
+
+Use the available tools when additional information would help you understand the incident.
+
+Only classify an incident as CRITICAL when the available evidence shows immediate or near-term serious business impact.
+Do not assume deadlines, financial impact, compliance impact, affected users, or affected transaction volumes unless they are provided by the ticket or tool results.
+
+Ticket: {ticket_txt}
+"""
+        }
+    ]
+
+    while True:
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=700,
+            system=SYSTEM_PROMPT,
+            tools=tools,
+            messages=messages
+        )
+
+        print("\nClaude response:")
+        print(response)
+
+        # Save Claude's response in conversation history
+        messages.append(
+            {
+                "role": "assistant",
+                "content": response.content
+            }
+        )
+
+        # If Claude is finished, return its answer
+        if response.stop_reason != "tool_use":
+            return response
+
+        # Otherwise execute every tool Claude requested
+        tool_results = []
+
+        for block in response.content:
+
+            if block.type == "tool_use":
+
+                print("\nTool requested:", block.name)
+                print("Tool input:", block.input)
+
+                result = execute_tool(
+                    block.name,
+                    block.input
+                )
+
+                print("Tool result:", result)
+
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result)
+                    }
+                )
+
+        # Give the tool results back to Claude
+        messages.append(
+            {
+                "role": "user",
+                "content": tool_results
+            }
+        )
+final_response = run_agent(
+        "SAP is not responding and the invoice automation failed."
+    )
+
+print("\nFINAL RESPONSE:")
+
+for block in final_response.content:
+    if block.type == "text":
+        print(block.text)
